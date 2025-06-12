@@ -1,4 +1,11 @@
-from database import Base, engine
-from models import Pagamento  # importante para registrar a tabela
+# Arquivo: create_tables.py
 
-Base.metadata.create_all(bind=engine)
+from app import app
+from database import db
+# Importe TODOS os modelos
+from models import Produto, Plano, Pagamento, Subscricao
+
+with app.app_context():
+    print("Criando tabelas no banco de dados...")
+    db.create_all()
+    print("Tabelas criadas com sucesso!")
