@@ -1,97 +1,83 @@
-# Arquivo: app.py (VERSÃO COMPLETA E CORRIGIDA)
+import hmac
+import hashlib
+import json
 
-import os
-import mercadopago
-from flask import Flask, render_template, redirect
-from dotenv import load_dotenv
+WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET")
 
-# Meus outros arquivos
-from database import db
-from models import Produto, Plano, Pagamento, Subscricao
-from api_v2 import api_v2_blueprint
+@app.route('/notificacao', methods=['POST'])
+def notificacao():
+    request_id = request.headers.get("X-Request-Id")
+    signature = request.headers.get("X-Signature")
 
-# Carrega as variáveis do arquivo .env
-load_dotenv()
+    if not request_id or not signature:
+        print("Webhook: Headers de assinatura (X-Request-Id ou X-Signature) ausentes.")
+        return "Headers de assinatura ausentes.", 400
 
-# --- CONFIGURAÇÃO DA APLICAÇÃO ---
-app = Flask(__name__)
+    data = request.json
+    topic = data.get('type')
+    payment_id = data.get('data', {}).get('id')
 
-# Pega a URL do banco de dados do arquivo .env
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    if not topic or not payment_id:
+        print(f"Webhook: Payload inválido recebido: {data}")
+        return "Payload inválido.", 400
 
-# Inicializa o banco de dados com a aplicação
-db.init_app(app)
+    if not WEBHOOK_SECRET:
+        print("ERRO CRÍTICO: Segredo do Webhook (MERCADOPAGO_WEBHOOK_SECRET) não está configurado.")
+        return "OK", 200
 
-# Registra as rotas da nossa API (planos, pagamentos, etc.)
-app.register_blueprint(api_v2_blueprint)
+    parts = signature.split(',')
+    ts_part = next((part for part in parts if part.strip().startswith('ts=')), None)
+    v1_part = next((part for part in parts if part.strip().startswith('v1=')), None)
 
-# --- ROTAS PRINCIPAIS ---
+    if not ts_part or not v1_part:
+        print(f"Webhook: Assinatura com formato inválido: {signature}")
+        return "Formato de assinatura inválido.", 400
 
-@app.route("/")
-def homepage():
-    """Renderiza a página inicial."""
-    return render_template("homepage.html")
-
-@app.route("/pagar")
-def pagar():
-    """Cria a preferência de pagamento e redireciona o usuário."""
+    ts = ts_part.strip().split('=')[1]
+    v1 = v1_part.strip().split('=')[1]
     
-    # Pega o Access Token do arquivo .env
-    access_token = os.getenv("MERCADOPAGO_ACCESS_TOKEN")
+    manifest = f"id:{payment_id};request-id:{request_id};ts:{ts};"
 
-    # Verifica se o token foi carregado
-    if not access_token:
-        return "Erro: MERCADOPAGO_ACCESS_TOKEN não encontrado no arquivo .env", 500
+    expected_signature = hmac.new(
+        WEBHOOK_SECRET.encode(),
+        msg=manifest.encode(),
+        digestmod=hashlib.sha256
+    ).hexdigest()
 
-    sdk = mercadopago.SDK(access_token)
+    if not hmac.compare_digest(expected_signature, v1):
+        print(f"Webhook: Assinatura inválida! Esperado: {expected_signature}, Recebido: {v1}")
+        return "Assinatura inválida.", 403
 
-    # Dados da preferência de pagamento
-    preference_data = {
-        "items": [
-            {
-                "title": "Assinatura VIP",
-                "quantity": 1,
-                "currency_id": "BRL",
-                "unit_price": 150.00
-            }
-        ],
-        "back_urls": {
-            "success": "http://127.0.0.1:5000/concluido",
-            "failure": "http://127.0.0.1:5000/falha",
-        }
-    }
+    print(f"Webhook com assinatura validada para o pagamento: {payment_id}")
 
-    try:
-        # Tenta criar a preferência
-        preference_response = sdk.preference().create(preference_data)
-        
-        # Verifica se a resposta foi bem-sucedida E se contém o link
-        if preference_response["status"] == 201 and "init_point" in preference_response["response"]:
-            init_point = preference_response["response"]["init_point"]
-            return redirect(init_point)
-        else:
-            # Se deu erro, imprime a resposta do MP no console
-            print("--- ERRO DO MERCADO PAGO ---")
-            print(preference_response)
-            return "Erro ao criar preferência. Verifique o console do terminal para mais detalhes.", 500
+    if topic == 'payment':
+        try:
+            sdk = mercadopago.SDK(os.getenv("MERCADOPAGO_ACCESS_TOKEN"))
+            payment_info = sdk.payment().get(payment_id)
 
-    except Exception as e:
-        # Se qualquer outro erro acontecer
-        print(f"--- ERRO INESPERADO NO CÓDIGO ---")
-        print(e)
-        return "Um erro inesperado ocorreu. Verifique o console do terminal.", 500
+            if payment_info["status"] == 200:
+                payment_data = payment_info["response"]
+                
+                pagamento_a_atualizar = Pagamentos.query.filter_by(payment_id=str(payment_data['id'])).first()
 
+                if pagamento_a_atualizar:
+                    pagamento_a_atualizar.status = payment_data['status']
+                    db.session.commit()
+                    print(f"Banco de dados atualizado para o pagamento {payment_id} com status '{payment_data['status']}'")
 
-@app.route("/concluido")
-def concluido():
-    return "<h1>Pagamento Concluído com Sucesso!</h1>"
+                    if payment_data['status'] == 'approved':
+                        print(f"Pagamento {payment_id} foi APROVADO.")
+                    else:
+                        print(f"Pagamento {payment_id} teve status atualizado para {payment_data['status']}.")
 
-@app.route("/falha")
-def falha():
-    return "<h1>O Pagamento Falhou.</h1>"
+                else:
+                    print(f"AVISO: Pagamento com payment_id {payment_id} não encontrado no banco de dados para atualização.")
 
+            else:
+                print(f"Erro ao buscar informações do pagamento {payment_id} na API do Mercado Pago.")
 
-# Este bloco só é executado quando rodamos 'python app.py' diretamente
-if __name__ == '__main__':
-    app.run(debug=True)
+        except Exception as e:
+            print(f"Erro ao processar o webhook para o pagamento {payment_id}: {e}")
+            db.session.rollback() 
+    
+    return "OK", 200
